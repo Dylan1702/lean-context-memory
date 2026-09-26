@@ -14,6 +14,7 @@ Requirements: 8.1 (distinct nodes), 8.2 (conditional entry point), 8.3 (SqliteSa
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Literal
 
@@ -101,7 +102,12 @@ def build_graph(checkpointer=None) -> StateGraph:
 
     # --- Checkpointing (Requirement 8.3) ---
     if checkpointer is None:
-        checkpointer = SqliteSaver.from_conn_string(CHECKPOINT_DB_PATH)
+        # Open a persistent connection for the lifetime of the app.
+        # SqliteSaver.from_conn_string() is a context manager — calling it
+        # without `with` yields a _GeneratorContextManager, not a SqliteSaver.
+        # Instead, open the connection directly so it stays alive for the REPL.
+        conn = sqlite3.connect(CHECKPOINT_DB_PATH, check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
 
     app = builder.compile(checkpointer=checkpointer)
     logger.debug("Graph compiled with checkpointer: %s", type(checkpointer).__name__)
