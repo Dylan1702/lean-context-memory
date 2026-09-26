@@ -1,0 +1,24 @@
+# Lean-Context Memory Management — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# LangGraph orchestration (1.x series installed)
+langgraph>=1.0.0
+langchain-core>=0.3.0
+langgraph-checkpoint-sqlite>=3.0.0
+
+# Local vector store (Tier 3)
+chromadb==0.5.23
+
+# Local Ollama client (Tier inference)
+ollama>=0.4.0
+
+# Local CPU-compatible embeddings for ChromaDB
+sentence-transformers>=3.0.0
+
+# Benchmark utilities
+psutil>=6.0.0
+matplotlib>=3.9.0
+
+# Testing
+pytest>=8.0.0
+pytest-mock>=3.14.0

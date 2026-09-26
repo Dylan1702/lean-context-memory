@@ -1,0 +1,38 @@
+# Lean-Context Memory Management — .gitignore
+
+# SQLite databases (generated at runtime)
+*.db
+*.db-wal
+*.db-shm
+
+# ChromaDB local persistence
+chroma_data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Pytest cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Benchmark outputs
+bench/output/
+*.csv
+*.png
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
