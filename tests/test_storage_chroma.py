@@ -103,6 +103,88 @@ def test_add_multiple_chunks_query_returns_up_to_n(chroma_env):
 
 
 # ---------------------------------------------------------------------------
+# Distance threshold — the core bug fix
+# ---------------------------------------------------------------------------
+
+def test_relevant_query_returns_chunk(chroma_env):
+    """A query semantically close to a stored chunk must still be returned."""
+    persist_dir, cname = chroma_env
+    add_narrative(
+        "My project target is to achieve 95 percent recall accuracy on MNIST.",
+        turn_index=1,
+        persist_dir=persist_dir,
+        collection_name=cname,
+    )
+    results = query_narrative(
+        "what is the recall goal for the project",
+        n_results=1,
+        persist_dir=persist_dir,
+        collection_name=cname,
+    )
+    assert len(results) == 1, "Related query should return the stored chunk"
+    assert "recall" in results[0].lower() or "mnist" in results[0].lower()
+
+
+def test_unrelated_query_returns_empty_list(chroma_env):
+    """
+    Root-cause regression test: a clearly unrelated query must return []
+    even when narrative chunks exist in the store.
+
+    Before the fix, query_narrative() had no distance threshold, so every
+    ACTIVE turn received the nearest chunk regardless of relevance — causing
+    the model to over-anchor on stored project context and refuse to answer
+    completely unrelated questions (e.g. 'name a planet').
+    """
+    persist_dir, cname = chroma_env
+    add_narrative(
+        "My project target is to achieve 95 percent recall accuracy on MNIST.",
+        turn_index=1,
+        persist_dir=persist_dir,
+        collection_name=cname,
+    )
+    results = query_narrative(
+        "name a planet in the solar system",
+        n_results=1,
+        persist_dir=persist_dir,
+        collection_name=cname,
+    )
+    assert results == [], (
+        "Unrelated query should return [] after distance filtering, "
+        f"got: {results}"
+    )
+
+
+def test_threshold_parameter_respected(chroma_env):
+    """Passing a very tight threshold (0.0) should always return []."""
+    persist_dir, cname = chroma_env
+    add_narrative("Machine learning optimisation techniques.", turn_index=0,
+                  persist_dir=persist_dir, collection_name=cname)
+    results = query_narrative(
+        "machine learning",
+        n_results=1,
+        max_distance=0.0,   # impossible threshold — nothing can be this close
+        persist_dir=persist_dir,
+        collection_name=cname,
+    )
+    assert results == [], "Zero threshold should always filter everything out"
+
+
+def test_threshold_parameter_loose(chroma_env):
+    """Passing max_distance=1.1 (wider than any cosine distance) returns all."""
+    persist_dir, cname = chroma_env
+    add_narrative("My project uses deep learning.", turn_index=0,
+                  persist_dir=persist_dir, collection_name=cname)
+    results = query_narrative(
+        "name a planet in the solar system",
+        n_results=1,
+        max_distance=1.1,   # wider than any cosine distance — nothing filtered
+        persist_dir=persist_dir,
+        collection_name=cname,
+    )
+    assert len(results) == 1, "With threshold 1.1 no chunk should be filtered"
+
+
+# ---------------------------------------------------------------------------
 # Embeddings are local — verify no network call is needed
 # (Indirectly verified: if test passes without internet it's CPU-only)
 # ---------------------------------------------------------------------------

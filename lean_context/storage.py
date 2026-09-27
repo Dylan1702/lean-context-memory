@@ -209,14 +209,28 @@ def add_narrative(
 def query_narrative(
     query: str,
     n_results: int = 3,
+    max_distance: float = 0.75,
     persist_dir: Optional[str] = None,
     collection_name: Optional[str] = None,
 ) -> list[str]:
     """
     Query ChromaDB for narrative chunks most semantically similar to *query*.
 
-    Returns at most *n_results* document strings.
-    On failure degrades gracefully — returns empty list (design.md Error Handling).
+    Only returns chunks whose cosine distance is below *max_distance*.
+    This prevents irrelevant stored narrative from being injected into the
+    prompt when the current query is on an entirely different topic — which
+    would cause the model to over-anchor on unrelated context and refuse to
+    answer the actual question.
+
+    Empirical distance ranges (all-MiniLM-L6-v2, cosine space):
+      clearly related   ≈ 0.35–0.55
+      loosely related   ≈ 0.55–0.75
+      clearly unrelated ≈ 0.80–1.00
+
+    Default threshold 0.75 keeps genuinely relevant chunks and drops noise.
+    Returns at most *n_results* document strings, or [] if none pass the
+    threshold (same as the existing empty-collection case).
+    On any ChromaDB failure degrades gracefully to [] (design.md Error Handling).
     Lifecycle state 4 — RETRIEVE.
     """
     collection = _get_collection()
@@ -225,9 +239,23 @@ def query_narrative(
         if count == 0:
             return []
         actual_n = min(n_results, count)
-        results = collection.query(query_texts=[query], n_results=actual_n)
+        results = collection.query(
+            query_texts=[query],
+            n_results=actual_n,
+            include=["documents", "distances"],
+        )
         docs = results.get("documents", [[]])[0]
-        return [d for d in docs if d]
+        distances = results.get("distances", [[]])[0]
+        # Filter by distance threshold — only return chunks close enough to be relevant
+        filtered = [
+            doc for doc, dist in zip(docs, distances)
+            if doc and dist <= max_distance
+        ]
+        logger.debug(
+            "query_narrative: %d/%d chunks passed distance threshold %.2f",
+            len(filtered), len(docs), max_distance,
+        )
+        return filtered
     except Exception as exc:
         logger.error("ChromaDB query failed (degrading gracefully): %s", exc)
         return []
