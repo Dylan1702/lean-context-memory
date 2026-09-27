@@ -1,8 +1,8 @@
 """
 bench/recall_test.py — 3-way recall accuracy test (Requirement 9.3).
 
-Plants 4 distinct facts at turns 2, 10, 25, 35 of a 50-turn conversation,
-then asks one recall question per fact at turn 50, across all three modes.
+Plants 4 distinct facts at turns 2, 6, 10, 14 of a 15-turn conversation,
+then asks one recall question per fact at the end, across all three modes.
 
 Scores exact-match recall per fact per mode and prints a table, e.g.:
 
@@ -21,7 +21,7 @@ Requirement 9.3: score is a fraction per mode, not a single pass/fail.
 
 Usage:
     python bench/recall_test.py
-    python bench/recall_test.py --turns 50 --output-dir bench/output
+    python bench/recall_test.py --turns 15 --output-dir bench/output
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ def check_recall(response: str, expected_substring: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def recall_lean(turns: list[str], tmp_dir: Path) -> dict[str, bool]:
-    """Run 50 turns with the full Lean pipeline, then ask recall questions."""
+    """Run all turns with the full Lean pipeline, then ask recall questions."""
     storage.SQLITE_DB_PATH = str(tmp_dir / "recall_lean.db")
     storage.CHROMA_PERSIST_DIR = str(tmp_dir / "chroma_recall_lean")
     storage._chroma_client = None
@@ -98,7 +98,7 @@ def recall_lean(turns: list[str], tmp_dir: Path) -> dict[str, bool]:
     app = build_graph(checkpointer=MemorySaver())
     config = {"configurable": {"thread_id": "recall-lean"}}
 
-    # Run all 50 turns
+    # Run all turns
     first = True
     for user_input in turns:
         if first:
@@ -124,7 +124,7 @@ def recall_lean(turns: list[str], tmp_dir: Path) -> dict[str, bool]:
 
 
 def recall_fifo(turns: list[str]) -> dict[str, bool]:
-    """Run 50 turns with FIFO-only, then ask recall questions at turn 51+."""
+    """Run all turns with FIFO-only, then ask recall questions."""
     ram_buffer: list[dict] = []
 
     def _run_turn(user_input: str) -> str:
@@ -159,7 +159,7 @@ def recall_fifo(turns: list[str]) -> dict[str, bool]:
 
 
 def recall_unmanaged(turns: list[str]) -> dict[str, bool]:
-    """Run 50 turns with full unbounded history, then ask recall questions."""
+    """Run all turns with full unbounded history, then ask recall questions."""
     full_history: list[dict] = []
 
     def _run_turn(user_input: str) -> str:
@@ -252,7 +252,7 @@ def save_results(results: dict[str, dict[str, bool]], output_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lean-Context recall accuracy test")
-    parser.add_argument("--turns", type=int, default=50)
+    parser.add_argument("--turns", type=int, default=15)
     parser.add_argument(
         "--output-dir", type=Path,
         default=_ROOT / "bench" / "output",

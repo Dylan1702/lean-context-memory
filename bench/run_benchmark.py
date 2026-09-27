@@ -5,17 +5,17 @@ Usage:
     python bench/run_benchmark.py --mode lean
     python bench/run_benchmark.py --mode fifo
     python bench/run_benchmark.py --mode unmanaged
-    python bench/run_benchmark.py --mode all        # runs all three, produces combined CSV + chart
+    python bench/run_benchmark.py --mode all        # runs all three, combined CSV + charts
 
 Modes (Requirement 9.4):
   lean       — full Lean-Context pipeline (SQLite + ChromaDB + RAM cap)
-  fifo       — RAM sliding window only, N=3 turns, no SQLite/ChromaDB
+  fifo       — RAM sliding window only, N=3 turns, no SQLite/ChromaDB (Baseline B)
   unmanaged  — full history appended to every prompt, unbounded (Baseline A)
 
-For each mode, runs the same scripted 50-turn conversation and records per turn:
-  ttft_ms          — time-to-first-token (total generate() call time, ms)
-  total_ms         — same as ttft_ms for local synchronous Ollama
-  rss_mb           — process resident set size (MB) at end of turn
+Per-turn metrics recorded:
+  ttft_ms  — wall-clock time for the full ollama.generate() call (ms)
+  total_ms — same value (synchronous local inference, no streaming split)
+  rss_mb   — process RSS at end of turn (MB)
 
 Output:
   bench/output/benchmark_results.csv   — combined CSV with 'mode' column
@@ -31,39 +31,44 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Literal
 
 import psutil
 import ollama
+from ollama import ResponseError
+
+# Force HuggingFace offline before any storage / embedding imports so the
+# sentence-transformers model loader never attempts a network round-trip to
+# check for updates even when model weights are already cached locally.
+# Without this flag, every embed() call can issue a slow HTTP HEAD request
+# to hf.co, which was the root cause of ~3.6 min/turn benchmark times.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 # Ensure project root on path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from lean_context import storage
-from lean_context.nodes import (
-    assemble_context_node,
-    local_inference_node,
-    OllamaUnavailableError,
-    RAM_BUFFER_CAP,
-    GraphState,
-)
+from lean_context.nodes import RAM_BUFFER_CAP
 from lean_context.graph import build_graph
 from langgraph.checkpoint.memory import MemorySaver
 
 # ---------------------------------------------------------------------------
-# Scripted 50-turn conversation (same for all modes)
+# Scripted conversation — 15 turns with 4 facts planted at 2, 6, 10, 14
+# (Reduced from 50 to keep total benchmark runtime manageable on CPU.)
 # ---------------------------------------------------------------------------
 
-# Facts planted at specific turns for the recall test (bench/recall_test.py reuses this)
 PLANTED_FACTS = {
-    2:  ("my project target is to achieve 95% recall accuracy", "project_target", "95% recall accuracy"),
-    10: ("my dataset is MNIST handwritten digits",              "dataset",        "MNIST handwritten digits"),
-    25: ("set learning_rate to 0.001",                         "learning_rate",  "0.001"),
-    35: ("my preferred batch size is 64",                      "batch_size",     "64"),
+    2:  ("my project target is to achieve 95% recall accuracy",
+         "project_target", "95% recall accuracy"),
+    6:  ("my dataset is MNIST handwritten digits",
+         "dataset",        "MNIST handwritten digits"),
+    10: ("set learning_rate to 0.001",
+         "learning_rate",  "0.001"),
+    14: ("my preferred batch size is 64",
+         "batch_size",     "64"),
 }
 
-# Generic filler turns (indices not in PLANTED_FACTS)
 _FILLER_QUESTIONS = [
     "What is gradient descent?",
     "Explain the transformer architecture.",
@@ -80,44 +85,12 @@ _FILLER_QUESTIONS = [
     "Explain BERT.",
     "What is a language model?",
     "Describe tokenisation.",
-    "What is word embedding?",
-    "Explain cosine similarity.",
-    "What is precision vs recall?",
-    "How is F1 score calculated?",
-    "What is a confusion matrix?",
-    "Explain cross-entropy loss.",
-    "What is the vanishing gradient problem?",
-    "How do LSTMs work?",
-    "What is a GAN?",
-    "Describe reinforcement learning.",
-    "What is Q-learning?",
-    "Explain policy gradient.",
-    "What is a reward function?",
-    "How does RAG work?",
-    "What is vector similarity search?",
-    "Explain HNSW indexing.",
-    "What is quantisation?",
-    "Describe model pruning.",
-    "What is knowledge distillation?",
-    "How does Ollama work?",
-    "What is LangGraph?",
-    "Explain state machines.",
-    "What is a checkpointer?",
-    "What is SQLite WAL mode?",
-    "Describe ChromaDB.",
-    "What are embeddings?",
-    "Explain sentence transformers.",
-    "What is cosine distance?",
-    "How does ChromaDB store vectors?",
-    "What is a persistent client?",
-    "Explain metadata filtering.",
 ]
 
 
-def build_scripted_turns(n: int = 50) -> list[str]:
+def build_scripted_turns(n: int = 15) -> list[str]:
     """
-    Return a list of *n* user messages with facts planted at fixed turns.
-    Turn indices are 1-based to match the design doc / task description.
+    Return a list of *n* user messages with facts planted at fixed 1-based turns.
     """
     filler_iter = iter(_FILLER_QUESTIONS)
     turns: list[str] = []
@@ -128,29 +101,80 @@ def build_scripted_turns(n: int = 50) -> list[str]:
             try:
                 turns.append(next(filler_iter))
             except StopIteration:
-                turns.append(f"Tell me more about deep learning topic {i}.")
+                turns.append(f"Tell me about deep learning topic {i}.")
     return turns
 
 
 # ---------------------------------------------------------------------------
-# Mode runners
+# Ollama helper — token cap + timeout + retry
+# ---------------------------------------------------------------------------
+
+_OLLAMA_OPTIONS = {"num_predict": 80}    # cap response length; keeps per-turn time bounded
+_OLLAMA_TIMEOUT = 60                     # seconds before a single call is considered hung
+_OLLAMA_RETRIES = 2                      # attempts per turn before giving up and continuing
+
+
+def _call_ollama(prompt: str) -> tuple[str, float]:
+    """
+    Call ollama.generate with a response-length cap, a per-call timeout, and
+    up to _OLLAMA_RETRIES attempts.
+
+    Returns (response_text, elapsed_ms).
+    On persistent failure logs the error and returns ('[error]', elapsed_ms)
+    so the benchmark continues rather than crashing the whole run.
+    """
+    import httpx
+
+    last_exc: Exception | None = None
+    t0 = time.perf_counter()
+
+    for attempt in range(1, _OLLAMA_RETRIES + 1):
+        try:
+            client = ollama.Client(timeout=_OLLAMA_TIMEOUT)
+            resp = client.generate(
+                model="llama3.2:3b",
+                prompt=prompt,
+                options=_OLLAMA_OPTIONS,
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return resp["response"].strip(), elapsed_ms
+        except (httpx.ConnectError, httpx.ReadTimeout,
+                httpx.RemoteProtocolError, ResponseError,
+                ConnectionError, OSError) as exc:
+            last_exc = exc
+            if attempt < _OLLAMA_RETRIES:
+                backoff = 2 ** attempt          # 2s, then 4s
+                print(
+                    f"    [warn] Ollama error on attempt {attempt}/{_OLLAMA_RETRIES} "
+                    f"({type(exc).__name__}: {exc!s:.60}). "
+                    f"Retrying in {backoff}s…"
+                )
+                time.sleep(backoff)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    print(f"    [error] Ollama failed after {_OLLAMA_RETRIES} attempts: {last_exc!s:.80}")
+    return "[error]", elapsed_ms
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _rss_mb() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
 
-def _call_ollama(prompt: str) -> tuple[str, float]:
-    """Call ollama.generate and return (response_text, elapsed_ms)."""
-    t0 = time.perf_counter()
-    resp = ollama.generate(model="llama3.2:3b", prompt=prompt)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    return resp["response"].strip(), elapsed_ms
+def _print_turn(mode: str, i: int, total: int, elapsed_ms: float) -> None:
+    rss = _rss_mb()
+    print(f"  [{mode:>10}]  turn {i:2d}/{total}  {elapsed_ms:7.0f} ms  RSS {rss:.0f} MB")
 
+
+# ---------------------------------------------------------------------------
+# Mode runners
+# ---------------------------------------------------------------------------
 
 def run_lean(turns: list[str], tmp_dir: Path) -> list[dict]:
-    """Full Lean-Context pipeline. Uses isolated storage in tmp_dir."""
-    # Point storage at isolated paths for this benchmark run
+    """Full Lean-Context pipeline — isolated storage in tmp_dir."""
     storage.SQLITE_DB_PATH = str(tmp_dir / "bench_lean.db")
     storage.CHROMA_PERSIST_DIR = str(tmp_dir / "chroma_lean")
     storage._chroma_client = None
@@ -162,44 +186,39 @@ def run_lean(turns: list[str], tmp_dir: Path) -> list[dict]:
     records = []
 
     for i, user_input in enumerate(turns, start=1):
-        if first:
-            payload = {
+        payload = (
+            {
                 "user_input": user_input, "ram_buffer": [],
                 "extracted_facts": {}, "retrieved_facts": {},
                 "lean_prompt": "", "final_output": "",
             }
-            first = False
-        else:
-            payload = {"user_input": user_input}
+            if first
+            else {"user_input": user_input}
+        )
+        first = False
 
         t0 = time.perf_counter()
         result = app.invoke(payload, config=config)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
+        _print_turn("lean", i, len(turns), elapsed_ms)
         records.append({
             "mode": "lean", "turn": i,
             "ttft_ms": round(elapsed_ms, 2),
             "total_ms": round(elapsed_ms, 2),
             "rss_mb": round(_rss_mb(), 2),
         })
-        print(f"  [lean]  turn {i:2d}/{len(turns)}  {elapsed_ms:6.0f}ms  RSS {_rss_mb():.0f}MB")
 
     return records
 
 
 def run_fifo(turns: list[str]) -> list[dict]:
-    """
-    Baseline B: RAM-only sliding window, N=3, no SQLite/ChromaDB.
-    Isolates whether Tier 2/3 persistence is actually necessary (Req 9.4c).
-    """
+    """Baseline B: RAM-only sliding window, N=3, no SQLite/ChromaDB."""
     ram_buffer: list[dict] = []
     records = []
 
     for i, user_input in enumerate(turns, start=1):
-        # Build minimal prompt: system + last 3 RAM turns + current query
-        parts = [
-            "[SYSTEM]\nYou are a helpful assistant.",
-        ]
+        parts = ["[SYSTEM]\nYou are a helpful assistant."]
         if ram_buffer:
             hist = "\n".join(
                 f"User: {t['user']}\nAssistant: {t['assistant']}"
@@ -210,32 +229,26 @@ def run_fifo(turns: list[str]) -> list[dict]:
         prompt = "\n\n".join(parts)
 
         t0 = time.perf_counter()
-        try:
-            response, _ = _call_ollama(prompt)
-        except Exception:
-            response = "[error]"
+        response, _ = _call_ollama(prompt)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
-        # FIFO buffer
         ram_buffer.append({"user": user_input, "assistant": response})
         if len(ram_buffer) > RAM_BUFFER_CAP:
             ram_buffer = ram_buffer[-RAM_BUFFER_CAP:]
 
+        _print_turn("fifo", i, len(turns), elapsed_ms)
         records.append({
             "mode": "fifo", "turn": i,
             "ttft_ms": round(elapsed_ms, 2),
             "total_ms": round(elapsed_ms, 2),
             "rss_mb": round(_rss_mb(), 2),
         })
-        print(f"  [fifo]  turn {i:2d}/{len(turns)}  {elapsed_ms:6.0f}ms  RSS {_rss_mb():.0f}MB")
 
     return records
 
 
 def run_unmanaged(turns: list[str]) -> list[dict]:
-    """
-    Baseline A: full history appended to every prompt, unbounded (Req 9.4b).
-    """
+    """Baseline A: full unbounded history appended to every prompt."""
     full_history: list[dict] = []
     records = []
 
@@ -251,21 +264,18 @@ def run_unmanaged(turns: list[str]) -> list[dict]:
         prompt = "\n\n".join(parts)
 
         t0 = time.perf_counter()
-        try:
-            response, _ = _call_ollama(prompt)
-        except Exception:
-            response = "[error]"
+        response, _ = _call_ollama(prompt)
         elapsed_ms = (time.perf_counter() - t0) * 1000
 
         full_history.append({"user": user_input, "assistant": response})
 
+        _print_turn("unmanaged", i, len(turns), elapsed_ms)
         records.append({
             "mode": "unmanaged", "turn": i,
             "ttft_ms": round(elapsed_ms, 2),
             "total_ms": round(elapsed_ms, 2),
             "rss_mb": round(_rss_mb(), 2),
         })
-        print(f"  [unmanaged]  turn {i:2d}/{len(turns)}  {elapsed_ms:6.0f}ms  RSS {_rss_mb():.0f}MB")
 
     return records
 
@@ -293,7 +303,9 @@ def save_charts(csv_path: Path, output_dir: Path) -> None:
     import matplotlib.pyplot as plt
     from collections import defaultdict
 
-    data: dict[str, dict[str, list]] = defaultdict(lambda: {"turn": [], "ttft_ms": [], "rss_mb": []})
+    data: dict[str, dict[str, list]] = defaultdict(
+        lambda: {"turn": [], "ttft_ms": [], "rss_mb": []}
+    )
     with open(csv_path) as f:
         for row in csv_mod.DictReader(f):
             mode = row["mode"]
@@ -303,33 +315,22 @@ def save_charts(csv_path: Path, output_dir: Path) -> None:
 
     colors = {"lean": "tab:blue", "fifo": "tab:orange", "unmanaged": "tab:red"}
 
-    # TTFT chart
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for mode, vals in data.items():
-        ax.plot(vals["turn"], vals["ttft_ms"], label=mode, color=colors.get(mode))
-    ax.set_xlabel("Turn")
-    ax.set_ylabel("TTFT (ms)")
-    ax.set_title("Time-to-First-Token vs Turn — 3-way comparison")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ttft_path = output_dir / "ttft_chart.png"
-    fig.savefig(ttft_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  → TTFT chart: {ttft_path}")
-
-    # RSS chart
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for mode, vals in data.items():
-        ax.plot(vals["turn"], vals["rss_mb"], label=mode, color=colors.get(mode))
-    ax.set_xlabel("Turn")
-    ax.set_ylabel("RSS (MB)")
-    ax.set_title("Process RSS vs Turn — 3-way comparison")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    rss_path = output_dir / "rss_chart.png"
-    fig.savefig(rss_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  → RSS chart: {rss_path}")
+    for metric, ylabel, title, filename in [
+        ("ttft_ms", "TTFT (ms)", "Time-to-First-Token vs Turn — 3-way comparison", "ttft_chart.png"),
+        ("rss_mb",  "RSS (MB)",  "Process RSS vs Turn — 3-way comparison",         "rss_chart.png"),
+    ]:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for mode, vals in data.items():
+            ax.plot(vals["turn"], vals[metric], label=mode, color=colors.get(mode))
+        ax.set_xlabel("Turn")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        out_path = output_dir / filename
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  → Chart: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +346,8 @@ def main() -> None:
         help="Which pipeline mode(s) to benchmark (default: all)",
     )
     parser.add_argument(
-        "--turns", type=int, default=50,
-        help="Number of scripted turns (default: 50)",
+        "--turns", type=int, default=15,
+        help="Number of scripted turns (default: 15)",
     )
     parser.add_argument(
         "--output-dir", type=Path,
@@ -371,28 +372,31 @@ def main() -> None:
         )
         sys.exit(1)
 
-    modes_to_run = ["lean", "fifo", "unmanaged"] if args.mode == "all" else [args.mode]
+    modes_to_run = (
+        ["lean", "fifo", "unmanaged"] if args.mode == "all" else [args.mode]
+    )
 
-    # Clear existing CSV so charts are clean
+    # Clear existing CSV so charts are clean when running all modes
     csv_path = output_dir / "benchmark_results.csv"
     if csv_path.exists() and args.mode == "all":
         csv_path.unlink()
 
-    all_records: list[dict] = []
     for mode in modes_to_run:
-        print(f"\n{'='*50}")
-        print(f"Running mode: {mode}  ({args.turns} turns)")
-        print(f"{'='*50}")
+        print(f"\n{'='*52}")
+        print(f"  Mode: {mode}   ({len(turns)} turns, cap {_OLLAMA_OPTIONS['num_predict']} tokens)")
+        print(f"{'='*52}")
         if mode == "lean":
             records = run_lean(turns, tmp_dir)
         elif mode == "fifo":
             records = run_fifo(turns)
         else:
             records = run_unmanaged(turns)
-        all_records.extend(records)
         save_csv(records, output_dir)
 
-    if len(modes_to_run) > 1 or args.mode == "all":
+        avg = sum(r["ttft_ms"] for r in records) / len(records)
+        print(f"  avg TTFT: {avg:.0f} ms  over {len(records)} turns")
+
+    if len(modes_to_run) > 1:
         print("\nGenerating charts…")
         save_charts(output_dir / "benchmark_results.csv", output_dir)
 

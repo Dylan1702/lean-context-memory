@@ -329,7 +329,11 @@ def local_inference_node(state: GraphState) -> dict:
     ram = list(state.get("ram_buffer", []))
 
     try:
-        response = _ollama_client.generate(model="llama3.2:3b", prompt=lean_prompt)
+        response = _ollama_client.generate(
+            model="llama3.2:3b",
+            prompt=lean_prompt,
+            options={"num_predict": 80},    # cap response length to keep per-turn time bounded
+        )
         assistant_text: str = response["response"].strip()
     except Exception as exc:
         # Catches connection errors, missing model, etc.

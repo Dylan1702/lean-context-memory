@@ -149,14 +149,28 @@ def init_chroma(
 
     Embeddings are generated with sentence-transformers (all-MiniLM-L6-v2)
     entirely on-CPU — no network calls (Requirement 4.3).
+
+    HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE are set to "1" before loading the
+    embedding function so that HuggingFace Hub never attempts a network round-trip
+    to check for model updates on every call.  Without this, each embed() call
+    can trigger a slow (or blocking) HTTP HEAD request to hf.co even when the
+    model weights are already cached locally — which was the root cause of the
+    ~3.6 min/turn benchmark slowness.
     """
+    import os as _os
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
     global _chroma_client, _chroma_collection
 
     _persist_dir = persist_dir if persist_dir is not None else CHROMA_PERSIST_DIR
     _collection_name = collection_name if collection_name is not None else CHROMA_COLLECTION_NAME
 
     ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
+        model_name="all-MiniLM-L6-v2",
+        # local_files_only=True is passed via the SentenceTransformer kwargs
+        # so the underlying model loader also never goes to the network.
+        local_files_only=True,
     )
 
     _chroma_client = chromadb.PersistentClient(path=_persist_dir)
