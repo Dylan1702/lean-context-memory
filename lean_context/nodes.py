@@ -9,27 +9,55 @@ nodes.py — LangGraph node implementations for the Lean-Context pipeline.
   5. FORGET   — drop social filler before it reaches any storage tier
 
 Node → lifecycle mapping (per design.md table):
-  evict_node          → FORGET  (state 5)
-  persist_node        → ARCHIVE (state 3)
-  active_ram_node     → KEEP (append) + RETRIEVE (query both stores)
-  assemble_context    → no lifecycle state; pure prompt builder
-  local_inference_node → KEEP (final append) + COMPRESS (buffer trim)
+  evict_node           → FORGET  (state 5)
+  persist_node         → ARCHIVE (state 3)
+  active_ram_node      → KEEP (append) + RETRIEVE (query both stores)
+  assemble_context_node → no lifecycle state; pure prompt builder
+  local_inference_node  → KEEP (final append) + COMPRESS (buffer trim)
+
+METRICS
+  Module-level counters accumulated across the lifetime of the process:
+    METRICS["llm_calls"]           int   — successful Ollama calls
+    METRICS["prompt_tokens"]       int   — sum of prompt_eval_count
+    METRICS["completion_tokens"]   int   — sum of eval_count
+    METRICS["model_ms"]            float — total ms inside Ollama
+    METRICS["memory_ms"]           float — total ms in router+persist+active_ram+assemble
+    METRICS["server_total_ms"]     float — sum of total_duration / 1e6
+    METRICS["created_at"]          str|None — ISO timestamp of last call
+
+  Use reset_metrics() to zero all counters, snapshot_metrics() to read a copy.
+
+NONCE
+  Every prompt assembled by assemble_context_node is prefixed with a unique
+  per-turn request ID "[req N]\\n" so Ollama's KV-cache cannot carry over a
+  cached prefix from a previous turn with the same text.  The nonce does not
+  affect the semantic content visible to the model.
+
+  Caching finding (measured on this machine, see git history):
+    - Identical prompt sent twice: call 1 ≈74s, call 2 ≈10s.
+    - prompt_eval_count is always the FULL count regardless of cache hit —
+      so caching does NOT hide the true prompt size in the metric.
+    - We add the nonce anyway to prevent accidental cross-turn cache hits
+      from flattening generation-time measurements in the benchmark.
 """
 
 from __future__ import annotations
 
 import re
+import time
+import threading
 import logging
 from typing import TypedDict
 
 import ollama as _ollama_client  # module-level import keeps mock target stable
 
 from lean_context import storage
+from lean_context.config import MODEL, OLLAMA_OPTIONS, NUM_CTX
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Task 5 — Graph state schema (Requirement 8.1, design.md §7)
+# Graph state schema (Requirement 8.1, design.md §7)
 # ---------------------------------------------------------------------------
 
 RAM_BUFFER_CAP = 3  # Requirement 2.1
@@ -63,18 +91,104 @@ class GraphState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
+# Module-level METRICS (thread-safe via lock)
+# ---------------------------------------------------------------------------
+
+_metrics_lock = threading.Lock()
+
+METRICS: dict = {
+    "llm_calls": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "model_ms": 0.0,
+    "memory_ms": 0.0,
+    "server_total_ms": 0.0,
+    "created_at": None,
+}
+
+
+def reset_metrics() -> None:
+    """Zero all METRICS counters.  Thread-safe."""
+    with _metrics_lock:
+        METRICS["llm_calls"] = 0
+        METRICS["prompt_tokens"] = 0
+        METRICS["completion_tokens"] = 0
+        METRICS["model_ms"] = 0.0
+        METRICS["memory_ms"] = 0.0
+        METRICS["server_total_ms"] = 0.0
+        METRICS["created_at"] = None
+
+
+def snapshot_metrics() -> dict:
+    """Return a shallow copy of METRICS.  Thread-safe."""
+    with _metrics_lock:
+        return dict(METRICS)
+
+
+def _update_metrics_from_response(resp: dict, model_ms: float) -> dict:
+    """
+    Extract per-call metrics from an Ollama response dict and accumulate into
+    the module-level METRICS.  Returns a per-call dict of the same shape for
+    use by callers that want per-turn values.
+
+    Missing fields are treated as 0 / None (tests pass plain dicts that omit
+    server fields).
+    """
+    prompt_tok  = int(resp.get("prompt_eval_count") or 0)
+    compl_tok   = int(resp.get("eval_count") or 0)
+    # total_duration is in nanoseconds
+    server_ms   = float((resp.get("total_duration") or 0)) / 1e6
+    created_at  = resp.get("created_at") or None
+
+    per_call = {
+        "prompt_tokens":    prompt_tok,
+        "completion_tokens": compl_tok,
+        "model_ms":         model_ms,
+        "server_total_ms":  server_ms,
+        "created_at":       created_at,
+    }
+
+    with _metrics_lock:
+        METRICS["llm_calls"]         += 1
+        METRICS["prompt_tokens"]     += prompt_tok
+        METRICS["completion_tokens"] += compl_tok
+        METRICS["model_ms"]          += model_ms
+        METRICS["server_total_ms"]   += server_ms
+        if created_at:
+            METRICS["created_at"] = created_at
+
+    # Warn if prompt is close to context-window limit
+    if prompt_tok > 0 and prompt_tok > 0.9 * NUM_CTX:
+        logger.warning(
+            "WARNING: prompt_eval_count=%d > 90%% of NUM_CTX=%d — prompt may be truncated",
+            prompt_tok, NUM_CTX,
+        )
+
+    return per_call
+
+
+# ---------------------------------------------------------------------------
+# Per-turn nonce counter
+# ---------------------------------------------------------------------------
+_nonce_counter = 0
+_nonce_lock = threading.Lock()
+
+
+def _next_nonce() -> str:
+    global _nonce_counter
+    with _nonce_lock:
+        _nonce_counter += 1
+        return f"[req {_nonce_counter}]"
+
+
+# ---------------------------------------------------------------------------
 # Extraction regex (shared by persist_node and tests)
 # ---------------------------------------------------------------------------
 
-# Patterns tried in order; first match wins
 _EXTRACTION_PATTERNS: list[tuple[str, re.Pattern]] = [
-    # "my <key> is <value>"
-    ("kv", re.compile(r"\bmy\s+(\w+)\s+is\s+(.+)", re.I)),
-    # "set <key> to <value>"
+    ("kv", re.compile(r"\bmy\s+((?:\w+\s+){0,2}?\w+)\s+is\s+(.+)", re.I)),
     ("kv", re.compile(r"\bset\s+(\w[\w_]*)\s+to\s+(.+)", re.I)),
-    # "key: value"
     ("kv", re.compile(r"^(\w[\w_\s]*?)\s*:\s+(.+)$", re.M)),
-    # "remember that <key> is <value>"
     ("kv", re.compile(r"\bremember\s+that\s+(?:my\s+)?(\w[\w_\s]*?)\s+is\s+(.+)", re.I)),
 ]
 
@@ -96,7 +210,7 @@ def extract_kv(text: str) -> tuple[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
-# Task 6 — Evict node: lifecycle state 5 — FORGET (Requirements 5.1, 5.2)
+# Evict node — lifecycle state 5: FORGET (Req 5.1, 5.2)
 # ---------------------------------------------------------------------------
 
 _EVICT_ACKNOWLEDGMENTS = [
@@ -127,7 +241,7 @@ def evict_node(state: GraphState) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Task 7 — Persist node: lifecycle state 3 — ARCHIVE (Requirements 3.1, 4.1)
+# Persist node — lifecycle state 3: ARCHIVE (Req 3.1, 4.1)
 # ---------------------------------------------------------------------------
 
 def persist_node(state: GraphState) -> dict:
@@ -139,10 +253,8 @@ def persist_node(state: GraphState) -> dict:
     2. No structured match but content is substantive →
        write as narrative to ChromaDB                (Tier 3, Req 4.1).
     3. Falls through; active_ram_node runs next for conversational reply.
-
-    'turn_index' is approximated from RAM buffer length so chunks carry a
-    meaningful position even before the buffer is updated this turn.
     """
+    _t0 = time.perf_counter()
     text = state["user_input"]
     ram = state.get("ram_buffer", [])
     turn_index = len(ram)
@@ -151,60 +263,43 @@ def persist_node(state: GraphState) -> dict:
     kv = extract_kv(text)
 
     if kv:
-        # ARCHIVE — structured fact to SQLite
         key, val = kv
         storage.set_fact(key, val)
         extracted = {key: val}
         logger.debug("persist_node: ARCHIVE SQLite — %s = %s", key, val)
     else:
-        # No structured match — check if content is substantive
-        # Heuristic: at least 6 words or contains a sentence-ending punctuation
         words = text.split()
         is_substantive = len(words) >= 6 or bool(re.search(r"[.!?]", text))
         if is_substantive:
             storage.add_narrative(text, turn_index=turn_index)
             logger.debug("persist_node: ARCHIVE ChromaDB narrative, turn=%d", turn_index)
-        else:
-            logger.debug("persist_node: content not substantive enough for storage")
+
+    with _metrics_lock:
+        METRICS["memory_ms"] += (time.perf_counter() - _t0) * 1000
 
     return {"extracted_facts": extracted}
 
 
 # ---------------------------------------------------------------------------
-# Task 8 — Active RAM node: lifecycle states 1 (KEEP) + 4 (RETRIEVE)
-# (Requirements 2.1, 2.2, 3.3, 4.2)
+# Active RAM node — lifecycle states 1 (KEEP) + 4 (RETRIEVE)
+# (Req 2.1, 2.2, 3.3, 4.2)
 # ---------------------------------------------------------------------------
 
 def active_ram_node(state: GraphState) -> dict:
     """
     Lifecycle state 1 — KEEP (reads current RAM buffer).
     Lifecycle state 4 — RETRIEVE (queries SQLite + ChromaDB).
-
-    Steps:
-      1. Read the existing RAM buffer from state (KEEP — will be appended to
-         after LLM inference in local_inference_node).
-      2. Query SQLite for all stored facts (Req 3.3).
-      3. Query ChromaDB for top-3 narrative chunks relevant to user_input (Req 4.2).
-      4. Stage everything into retrieved_facts for use by assemble_context_node.
-
-    The RAM buffer is NOT modified here — the append (KEEP) happens in
-    local_inference_node after the assistant reply is generated, so we don't
-    corrupt state on persist-routed turns that fall through here.
     """
+    _t0 = time.perf_counter()
     user_input = state["user_input"]
     ram = state.get("ram_buffer", [])
 
-    # RETRIEVE — Tier 2: all SQLite facts
     facts: dict = storage.get_all_facts()
     logger.debug("active_ram_node: RETRIEVE SQLite — %d facts", len(facts))
 
-    # RETRIEVE — Tier 3: top-3 ChromaDB narrative chunks
     narrative_chunks: list[str] = storage.query_narrative(user_input, n_results=3)
-    logger.debug(
-        "active_ram_node: RETRIEVE ChromaDB — %d chunks", len(narrative_chunks)
-    )
+    logger.debug("active_ram_node: RETRIEVE ChromaDB — %d chunks", len(narrative_chunks))
 
-    # Cap RAM to last RAM_BUFFER_CAP turns for context assembly
     capped_ram = ram[-RAM_BUFFER_CAP:] if len(ram) > RAM_BUFFER_CAP else ram
 
     retrieved_facts = {
@@ -213,142 +308,153 @@ def active_ram_node(state: GraphState) -> dict:
         "capped_ram": capped_ram,
     }
 
+    with _metrics_lock:
+        METRICS["memory_ms"] += (time.perf_counter() - _t0) * 1000
+
     return {"retrieved_facts": retrieved_facts}
 
 
 # ---------------------------------------------------------------------------
-# Task 9 — Context assembly node (Requirements 6.1, 6.2)
-# Prompt template: P = S_system + F_retrieved + M(t-N..t) + current query
+# Context assembly node (Req 6.1, 6.2)
+# Prompt template: P = [req N] + S_system + F_retrieved + M(t-N..t) + query
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = (
-    "You are a helpful, concise assistant. "
-    "You have access to stored facts and recent conversation history below. "
-    "Answer the user's question using that context where relevant."
-)
+_SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
 
 def assemble_context_node(state: GraphState) -> dict:
     """
-    Build the minimal prompt: S_system + F_retrieved + M(t-N..t) + current query.
+    Build the minimal prompt: nonce + S_system + F_retrieved + M(t-N..t) + query.
 
-    Prompt token count is bounded by a constant independent of total turns t
-    because:
-      - System prompt is fixed.
-      - Retrieved facts come from the (small, bounded) SQLite table.
-      - Narrative chunks are capped at n_results=3.
-      - RAM history is capped to last RAM_BUFFER_CAP (3) turns.
-    (Requirement 6.1, 6.2)
+    The nonce "[req N]" is prepended so Ollama's KV-cache cannot carry over a
+    cached prefix from a previous identical prompt.  See module docstring for
+    the caching finding that motivated this choice.
 
-    Assembled Prompt Layout (design.md §Context Assembly Node):
-      [SYSTEM]
-      <system instructions>
-
-      [FACTS]
-      key: value
-      ...
-
-      [RELEVANT CONTEXT]
-      - chunk text
-      ...
-
-      [RECENT CONVERSATION]
-      User: ...
-      Assistant: ...
-      ...
-
-      [CURRENT QUERY]
-      <user_input>
+    Prompt layout:
+      [req N]          ← unique per-turn nonce (cache-buster)
+      [SYSTEM]         ← fixed system prompt
+      [FACTS]          ← SQLite key-value facts (omitted if empty)
+      [RELEVANT CONTEXT] ← ChromaDB narrative chunks (omitted if empty)
+      [RECENT CONVERSATION] ← last ≤3 RAM turns (omitted if empty)
+      [CURRENT QUERY]  ← user_input this turn
     """
+    _t0 = time.perf_counter()
     user_input = state["user_input"]
     retrieved = state.get("retrieved_facts", {})
 
     facts: dict = retrieved.get("facts", {})
     narrative: list[str] = retrieved.get("narrative", [])
     capped_ram: list[dict] = retrieved.get("capped_ram", [])
-
-    # Enforce cap defensively even if active_ram_node was bypassed
     capped_ram = capped_ram[-RAM_BUFFER_CAP:]
 
-    parts: list[str] = []
+    nonce = _next_nonce()
+    parts: list[str] = [nonce, f"[SYSTEM]\n{_SYSTEM_PROMPT}"]
 
-    # --- System ---
-    parts.append(f"[SYSTEM]\n{_SYSTEM_PROMPT}")
-
-    # --- Facts ---
     if facts:
-        facts_lines = "\n".join(f"{k}: {v}" for k, v in facts.items())
-        parts.append(f"[FACTS]\n{facts_lines}")
+        parts.append("[FACTS]\n" + "\n".join(f"{k}: {v}" for k, v in facts.items()))
 
-    # --- Narrative ---
     if narrative:
-        narrative_lines = "\n".join(f"- {chunk}" for chunk in narrative)
-        parts.append(f"[RELEVANT CONTEXT]\n{narrative_lines}")
+        parts.append("[RELEVANT CONTEXT]\n" + "\n".join(f"- {c}" for c in narrative))
 
-    # --- Recent RAM turns ---
     if capped_ram:
-        history_lines = []
+        lines = []
         for turn in capped_ram:
-            history_lines.append(f"User: {turn['user']}")
-            history_lines.append(f"Assistant: {turn['assistant']}")
-        parts.append(f"[RECENT CONVERSATION]\n" + "\n".join(history_lines))
+            lines.append(f"User: {turn['user']}")
+            lines.append(f"Assistant: {turn['assistant']}")
+        parts.append("[RECENT CONVERSATION]\n" + "\n".join(lines))
 
-    # --- Current query ---
     parts.append(f"[CURRENT QUERY]\n{user_input}")
 
     lean_prompt = "\n\n".join(parts)
     logger.debug(
-        "assemble_context_node: prompt length=%d chars, ram_turns=%d",
-        len(lean_prompt),
-        len(capped_ram),
+        "assemble_context_node: nonce=%s prompt=%d chars ram=%d",
+        nonce, len(lean_prompt), len(capped_ram),
     )
+
+    with _metrics_lock:
+        METRICS["memory_ms"] += (time.perf_counter() - _t0) * 1000
+
     return {"lean_prompt": lean_prompt}
 
 
 # ---------------------------------------------------------------------------
-# Task 10 — Local inference node: lifecycle states 1 (KEEP) + 2 (COMPRESS)
-# (Requirements 7.1, 7.2, 7.3, 2.2)
+# Local inference node — lifecycle states 1 (KEEP) + 2 (COMPRESS)
+# (Req 7.1, 7.2, 7.3, 2.2)
 # ---------------------------------------------------------------------------
 
 class OllamaUnavailableError(Exception):
     """Raised when the local Ollama service cannot be reached (Req 7.2)."""
 
 
+_INFERENCE_TIMEOUT_S = 60
+_INFERENCE_RETRIES = 2
+
+
+def _generate_with_timeout(prompt: str) -> tuple[str, dict]:
+    """
+    Call Ollama with a hard timeout and retry.
+
+    Returns (response_text, per_call_metrics_dict).
+    Raises OllamaUnavailableError after all retries are exhausted.
+
+    Keeps calling the module-level `_ollama_client.generate` (not a Client
+    instance) so existing tests that patch that name continue to work.
+    The call runs in a worker thread so we can apply a hard timeout.
+    """
+    import concurrent.futures
+
+    last_exc: Exception | None = None
+
+    for attempt in range(1, _INFERENCE_RETRIES + 1):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        t0 = time.perf_counter()
+        try:
+            future = pool.submit(
+                _ollama_client.generate,
+                model=MODEL,
+                prompt=prompt,
+                options=OLLAMA_OPTIONS,
+            )
+            response = future.result(timeout=_INFERENCE_TIMEOUT_S)
+            model_ms = (time.perf_counter() - t0) * 1000
+            text = response["response"].strip()
+            per_call = _update_metrics_from_response(response, model_ms)
+            return text, per_call
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _INFERENCE_RETRIES:
+                backoff = 2 ** attempt
+                logger.warning(
+                    "local_inference_node: attempt %d/%d failed (%s). Retrying in %ds…",
+                    attempt, _INFERENCE_RETRIES, type(exc).__name__, backoff,
+                )
+                time.sleep(backoff)
+        finally:
+            pool.shutdown(wait=False)
+
+    raise OllamaUnavailableError(
+        "Local model unavailable — is `ollama serve` running?"
+    ) from last_exc
+
+
 def local_inference_node(state: GraphState) -> dict:
     """
     Lifecycle state 1 — KEEP  (append new turn to RAM buffer after generation).
     Lifecycle state 2 — COMPRESS (FIFO evict oldest turn when buffer > cap).
-
-    Calls ollama.generate(model='llama3.2:3b', prompt=lean_prompt).
-    On connection failure raises OllamaUnavailableError — caught at CLI boundary
-    so the user sees a clear message, not a raw stack trace (Req 7.2).
-    On success appends {user, assistant} to RAM buffer and trims to cap (Req 7.3).
     """
     lean_prompt = state.get("lean_prompt", "")
     user_input = state.get("user_input", "")
     ram = list(state.get("ram_buffer", []))
 
-    try:
-        response = _ollama_client.generate(
-            model="llama3.2:3b",
-            prompt=lean_prompt,
-            options={"num_predict": 80},    # cap response length to keep per-turn time bounded
-        )
-        assistant_text: str = response["response"].strip()
-    except Exception as exc:
-        # Catches connection errors, missing model, etc.
-        raise OllamaUnavailableError(
-            "Local model unavailable — is `ollama serve` running?"
-        ) from exc
+    assistant_text, _per_call = _generate_with_timeout(lean_prompt)
 
-    # KEEP — append new turn (lifecycle state 1)
-    new_turn = {"user": user_input, "assistant": assistant_text}
-    ram.append(new_turn)
+    # KEEP
+    ram.append({"user": user_input, "assistant": assistant_text})
 
-    # COMPRESS — FIFO evict oldest turn if buffer exceeds cap (lifecycle state 2)
+    # COMPRESS
     if len(ram) > RAM_BUFFER_CAP:
         ram = ram[-RAM_BUFFER_CAP:]
-        logger.debug("local_inference_node: COMPRESS — trimmed RAM to %d turns", RAM_BUFFER_CAP)
+        logger.debug("local_inference_node: COMPRESS — RAM trimmed to %d turns", RAM_BUFFER_CAP)
 
     logger.debug("local_inference_node: KEEP — RAM buffer now %d turns", len(ram))
 
