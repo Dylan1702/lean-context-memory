@@ -148,7 +148,7 @@ def _next_nonce() -> str:
 # Existing callers that do  response, _ = _call_ollama(...)  continue to work.
 # ---------------------------------------------------------------------------
 
-_OLLAMA_TIMEOUT = 60
+_OLLAMA_TIMEOUT = 300
 _OLLAMA_RETRIES = 2
 
 _META_EMPTY: dict = {

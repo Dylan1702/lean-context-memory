@@ -386,7 +386,7 @@ class OllamaUnavailableError(Exception):
     """Raised when the local Ollama service cannot be reached (Req 7.2)."""
 
 
-_INFERENCE_TIMEOUT_S = 60
+_INFERENCE_TIMEOUT_S = 300
 _INFERENCE_RETRIES = 2
 
 
