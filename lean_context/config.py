@@ -18,7 +18,7 @@ logging.getLogger("backoff").setLevel(logging.CRITICAL)
 
 MODEL: str = "llama3.2:3b"
 NUM_CTX: int = 8192       # context window passed to Ollama options
-NUM_PREDICT: int = 80     # max tokens per reply
+NUM_PREDICT: int = 256     # max tokens per reply
 
 # Options dict ready to splat into every ollama generate call.
 OLLAMA_OPTIONS: dict = {"num_ctx": NUM_CTX, "num_predict": NUM_PREDICT}

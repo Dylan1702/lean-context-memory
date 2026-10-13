@@ -7,7 +7,7 @@ from lean_context.config import MODEL, NUM_CTX, NUM_PREDICT, OLLAMA_OPTIONS, get
 def test_constants():
     assert MODEL == "llama3.2:3b"
     assert NUM_CTX == 8192
-    assert NUM_PREDICT == 80
+    assert NUM_PREDICT == 256
 
 
 def test_ollama_options_contains_required_keys():
