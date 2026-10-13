@@ -28,6 +28,10 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+# Import config first — sets posthog/urllib3/backoff loggers to CRITICAL
+# so ChromaDB telemetry warnings never appear during offline runs.
+import lean_context.config as _cfg  # noqa: F401
+
 logging.basicConfig(level=logging.WARNING)
 
 _ROOT = Path(__file__).resolve().parent.parent

@@ -19,7 +19,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# Silence ChromaDB telemetry before the library is imported so PostHog /
+# urllib3 retry messages never appear during offline runs.
+import os as _os
+_os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+_os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "")
+
 import chromadb
+import chromadb.config as _chroma_config
 from chromadb.utils import embedding_functions
 
 logger = logging.getLogger(__name__)
@@ -173,7 +180,10 @@ def init_chroma(
         local_files_only=True,
     )
 
-    _chroma_client = chromadb.PersistentClient(path=_persist_dir)
+    _chroma_client = chromadb.PersistentClient(
+        path=_persist_dir,
+        settings=_chroma_config.Settings(anonymized_telemetry=False, allow_reset=False),
+    )
     _chroma_collection = _chroma_client.get_or_create_collection(
         name=_collection_name,
         embedding_function=ef,

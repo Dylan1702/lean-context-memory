@@ -7,6 +7,15 @@ use identical options and startup banners are consistent.
 
 from __future__ import annotations
 
+import logging
+
+# Silence ChromaDB telemetry and urllib3 retry noise for offline runs.
+# These must be set before any chromadb / posthog import, which is
+# guaranteed because config.py is imported first by every entry-point.
+logging.getLogger("posthog").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.CRITICAL)
+logging.getLogger("backoff").setLevel(logging.CRITICAL)
+
 MODEL: str = "llama3.2:3b"
 NUM_CTX: int = 8192       # context window passed to Ollama options
 NUM_PREDICT: int = 80     # max tokens per reply
